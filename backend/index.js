@@ -3,10 +3,11 @@ const cors = require('cors')
 require('dotenv').config()
 
 const app = express()
-PORT = process.env.PORT
+const PORT = process.env.PORT || 3001
+const corsOrigin = process.env.CORS_ORIGIN || 'http://localhost:3000'
 const conn = require('./conn')
 app.use(express.json())
-app.use(cors())
+app.use(cors({ origin: corsOrigin }))
 
 const tripRoutes = require('./routes/trip.routes')
 

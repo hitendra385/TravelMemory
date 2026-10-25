@@ -1,0 +1,506 @@
+---
+- name: Configure TravelMemory infrastructure hosts
+  hosts: all
+  become: true
+  gather_facts: true
+  any_errors_fatal: true
+
+  vars:
+    app_repo: https://github.com/hitendra385/TravelMemory.git
+    app_branch: main
+    app_root: /opt/travelmemory
+    web_root: /var/www/travelmemory
+    mongo_version: "8.0"
+    mongo_database: travelmemory
+    mongo_root_user: travelmemory_admin
+    mongo_app_user: travelmemory_app
+    api_port: 3001
+
+  vars_prompt:
+    - name: mongo_root_password
+      prompt: MongoDB administrator password
+      private: true
+      confirm: true
+    - name: mongo_app_password
+      prompt: TravelMemory MongoDB application-user password
+      private: true
+      confirm: true
+
+  tasks:
+    - name: Install Git
+      ansible.builtin.dnf:
+        name: git
+        state: present
+
+    - name: Install host firewall
+      ansible.builtin.dnf:
+        name: firewalld
+        state: present
+
+    - name: Enable host firewall
+      ansible.builtin.service:
+        name: firewalld
+        enabled: true
+        state: started
+
+    - name: Harden SSH daemon configuration
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/00-travelmemory-hardening.conf
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          PermitRootLogin no
+          PasswordAuthentication no
+          PermitEmptyPasswords no
+          PubkeyAuthentication yes
+      notify: Restart SSH daemon
+
+    - name: Validate SSH daemon configuration
+      ansible.builtin.command: /usr/sbin/sshd -t
+      changed_when: false
+
+    - name: Allow SSH through the host firewall
+      ansible.posix.firewalld:
+        port: 22/tcp
+        permanent: true
+        immediate: true
+        state: enabled
+
+    - name: Allow web traffic through the host firewall
+      ansible.posix.firewalld:
+        port: "{{ item }}"
+        permanent: true
+        immediate: true
+        state: enabled
+      loop:
+        - 80/tcp
+        - 443/tcp
+      when: "'web' in group_names"
+
+    - name: Allow MongoDB traffic through the database host firewall
+      ansible.posix.firewalld:
+        port: 27017/tcp
+        permanent: true
+        immediate: true
+        state: enabled
+      when: "'database' in group_names"
+
+    - name: Check whether the API service is already installed
+      ansible.builtin.stat:
+        path: /etc/systemd/system/travelmemory-api.service
+      register: travelmemory_api_unit
+      when: "'web' in group_names"
+
+    - name: Stop the API during deployment
+      ansible.builtin.systemd:
+        name: travelmemory-api
+        state: stopped
+      when:
+        - "'web' in group_names"
+        - travelmemory_api_unit.stat.exists
+
+    - name: Install Node.js and Nginx on the web host
+      ansible.builtin.dnf:
+        name:
+          - nodejs
+          - nginx
+        state: present
+      when: "'web' in group_names"
+
+    - name: Add the official MongoDB repository
+      ansible.builtin.yum_repository:
+        name: mongodb-org-8.0
+        description: MongoDB 8.0 repository
+        baseurl: https://repo.mongodb.org/yum/amazon/2023/mongodb-org/8.0/x86_64/
+        gpgcheck: true
+        gpgkey: https://pgp.mongodb.com/server-8.0.asc
+        enabled: true
+      when: "'database' in group_names"
+
+    - name: Install MongoDB
+      ansible.builtin.dnf:
+        name: mongodb-org
+        state: present
+      when: "'database' in group_names"
+
+    - name: Configure MongoDB authentication and private-network binding
+      ansible.builtin.template:
+        src: templates/mongod.conf.j2
+        dest: /etc/mongod.conf
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart MongoDB
+      when: "'database' in group_names"
+
+    - name: Enable MongoDB
+      ansible.builtin.service:
+        name: mongod
+        enabled: true
+        state: started
+      when: "'database' in group_names"
+
+    - name: Wait for MongoDB on loopback
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: 27017
+        timeout: 60
+      when: "'database' in group_names"
+
+    - name: Apply MongoDB authorization before creating users
+      ansible.builtin.meta: flush_handlers
+      when: "'database' in group_names"
+
+    - name: Create MongoDB administrator and application users
+      ansible.builtin.shell: |
+        mongosh --quiet --host 127.0.0.1 admin <<'MONGO'
+        const adminDb = db.getSiblingDB("admin");
+        const rootUser = {{ mongo_root_user | to_json }};
+        const rootPassword = {{ mongo_root_password | to_json }};
+        const appUser = {{ mongo_app_user | to_json }};
+        const appPassword = {{ mongo_app_password | to_json }};
+        const databaseName = {{ mongo_database | to_json }};
+        let changed = false;
+        let stage = "admin-authentication";
+        const authSucceeded = result => result === 1 || result === true || (result && result.ok === 1);
+
+        (async () => {
+          try {
+            stage = "admin-first-user-create";
+            await adminDb.createUser({
+              user: rootUser,
+              pwd: rootPassword,
+              roles: [{ role: "root", db: "admin" }]
+            });
+            stage = "admin-first-user-authentication";
+            if (!authSucceeded(await adminDb.auth({ user: rootUser, pwd: rootPassword }))) {
+              throw new Error("Could not authenticate the new MongoDB administrator.");
+            }
+            changed = true;
+          } catch (createError) {
+            stage = "admin-existing-user-authentication";
+            let adminAuthenticated = false;
+            try {
+              adminAuthenticated = authSucceeded(await adminDb.auth({ user: rootUser, pwd: rootPassword }));
+            } catch (authError) {
+              adminAuthenticated = false;
+            }
+            if (!adminAuthenticated) throw createError;
+          }
+
+          stage = "application-user-lookup";
+          const appDb = db.getSiblingDB(databaseName);
+          let existingAppUser;
+          try {
+            existingAppUser = await appDb.getUser(appUser);
+          } catch (error) {
+            if (error.code !== 11 && error.codeName !== "UserNotFound") throw error;
+          }
+          const appUserUpdate = {
+            pwd: appPassword,
+            roles: [{ role: "readWrite", db: databaseName }],
+            authenticationRestrictions: []
+          };
+          if (!existingAppUser) {
+            stage = "application-user-create";
+            await appDb.createUser({ user: appUser, ...appUserUpdate });
+          } else {
+            stage = "application-user-update";
+            await appDb.updateUser(appUser, appUserUpdate);
+          }
+          changed = true;
+
+          if (changed) print("MONGO_USERS_SYNCED");
+        })().catch(error => {
+          print(`MONGO_USER_SETUP_ERROR=${stage}:${error.codeName || error.name}`);
+          quit(1);
+        });
+        MONGO
+      args:
+        executable: /bin/bash
+      register: mongo_user_setup
+      changed_when: "'MONGO_USERS_SYNCED' in mongo_user_setup.stdout"
+      failed_when: false
+      no_log: true
+      when: "'database' in group_names"
+
+    - name: Report safe MongoDB user setup status
+      ansible.builtin.debug:
+        msg: "{{ mongo_user_setup.stdout | trim | default('No MongoDB user setup status returned', true) }}"
+      when: "'database' in group_names"
+
+    - name: Require MongoDB user setup
+      ansible.builtin.assert:
+        that:
+          - mongo_user_setup.rc == 0
+        fail_msg: MongoDB user setup failed; inspect the safe status above.
+      when: "'database' in group_names"
+
+    - name: Verify MongoDB app user on the database host
+      ansible.builtin.shell: |
+        mongosh --quiet --host 127.0.0.1 admin <<'MONGO'
+        const databaseName = {{ mongo_database | to_json }};
+        const appUser = {{ mongo_app_user | to_json }};
+        const appPassword = {{ mongo_app_password | to_json }};
+        const authSucceeded = result => result === 1 || result === true || (result && result.ok === 1);
+        (async () => {
+          const appConnection = new Mongo("127.0.0.1:27017");
+          const appDb = appConnection.getDB(databaseName);
+          let stage = "application-authentication";
+          try {
+            if (!authSucceeded(await appDb.auth({ user: appUser, pwd: appPassword }))) {
+              print("MONGO_LOCAL_VERIFY_ERROR=application-authentication:AuthenticationFailed");
+              quit(1);
+            }
+            stage = "application-ping";
+            const pingResult = await appDb.runCommand({ ping: 1 });
+            if (pingResult.ok !== 1) {
+              print("MONGO_LOCAL_VERIFY_ERROR=application-ping:MongoCommandFailed");
+              quit(1);
+            }
+            print("MONGO_LOCAL_VERIFY_OK");
+          } catch (error) {
+            print(`MONGO_LOCAL_VERIFY_ERROR=${stage}:${error.codeName || error.name}`);
+            quit(1);
+          }
+        })();
+        MONGO
+      args:
+        executable: /bin/bash
+      no_log: true
+      register: mongo_local_preflight
+      changed_when: false
+      failed_when: false
+      when: "'database' in group_names"
+
+    - name: Report safe local MongoDB status
+      ansible.builtin.debug:
+        msg: "{{ mongo_local_preflight.stdout | trim | default('No local MongoDB status returned', true) }}"
+      when: "'database' in group_names"
+
+    - name: Require local MongoDB app authentication
+      ansible.builtin.assert:
+        that:
+          - mongo_local_preflight.rc == 0
+        fail_msg: MongoDB app credentials failed verification on the database host.
+      when: "'database' in group_names"
+
+    - name: Create the application service account
+      ansible.builtin.user:
+        name: travelmemory
+        system: true
+        home: /var/lib/travelmemory
+        create_home: true
+        shell: /sbin/nologin
+        state: present
+      when: "'web' in group_names"
+
+    - name: Create the application directory
+      ansible.builtin.file:
+        path: "{{ app_root }}"
+        state: directory
+        owner: travelmemory
+        group: travelmemory
+        mode: "0755"
+      when: "'web' in group_names"
+
+    - name: Clone TravelMemory
+      ansible.builtin.git:
+        repo: "{{ app_repo }}"
+        dest: "{{ app_root }}"
+        version: "{{ app_branch }}"
+        update: true
+        force: true
+      become_user: travelmemory
+      when: "'web' in group_names"
+
+    - name: Copy the local backend source
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../backend/"
+        dest: "{{ app_root }}/backend/"
+        owner: travelmemory
+        group: travelmemory
+        mode: preserve
+      when: "'web' in group_names"
+
+    - name: Install backend dependencies
+      ansible.builtin.command: npm ci
+      args:
+        chdir: "{{ app_root }}/backend"
+      environment:
+        HOME: /var/lib/travelmemory
+      become_user: travelmemory
+      when: "'web' in group_names"
+
+    - name: Install frontend dependencies and build the React app locally
+      ansible.builtin.command: "{{ item }}"
+      args:
+        chdir: "{{ playbook_dir }}/../frontend"
+      become: false
+      delegate_to: localhost
+      loop:
+        - npm ci
+        - npm run build
+      when: "'web' in group_names"
+
+    - name: Install the API environment file
+      ansible.builtin.template:
+        src: templates/travelmemory-api.env.j2
+        dest: /etc/travelmemory-api.env
+        owner: root
+        group: travelmemory
+        mode: "0640"
+      no_log: true
+      notify: Restart TravelMemory API
+      when: "'web' in group_names"
+
+    - name: Verify MongoDB credentials from the web host
+      ansible.builtin.command:
+        argv:
+          - node
+          - -e
+          - |
+            const { MongoClient } = require("mongodb");
+            const password = Buffer.from(process.env.MONGO_PASSWORD_BASE64, "base64").toString("utf8");
+            let stage = "application-authentication";
+            const client = new MongoClient(process.env.MONGO_URI, {
+              auth: { username: process.env.MONGO_USER, password },
+              authSource: process.env.MONGO_AUTH_SOURCE,
+              serverSelectionTimeoutMS: 10000
+            });
+            console.log(`MONGO_VERIFY_TARGET=${new URL(process.env.MONGO_URI).host};MONGO_USER=${process.env.MONGO_USER};MONGO_AUTH_SOURCE=${process.env.MONGO_AUTH_SOURCE}`);
+            client.connect()
+              .then(() => {
+                stage = "application-ping";
+                return client.db("{{ mongo_database }}").command({ ping: 1 });
+              })
+              .then(async () => {
+                await client.close();
+                console.log("MONGO_VERIFY_OK");
+              })
+              .catch(async error => {
+                console.log(`MONGO_VERIFY_ERROR=${stage}:${error.codeName || error.name}`);
+                await client.close().catch(() => {});
+                process.exitCode = 1;
+              });
+      args:
+        chdir: "{{ app_root }}/backend"
+      environment:
+        MONGO_URI: "mongodb://{{ hostvars['database_server'].ansible_host }}:27017/{{ mongo_database }}"
+        MONGO_USER: "{{ mongo_app_user }}"
+        MONGO_PASSWORD_BASE64: "{{ mongo_app_password | b64encode }}"
+        MONGO_AUTH_SOURCE: "{{ mongo_database }}"
+      become_user: travelmemory
+      no_log: true
+      register: mongo_api_preflight
+      changed_when: false
+      failed_when: false
+      when: "'web' in group_names"
+
+    - name: Report safe MongoDB preflight status
+      ansible.builtin.debug:
+        msg: "{{ mongo_api_preflight.stdout | trim | default('No MongoDB preflight status returned', true) }}"
+      when: "'web' in group_names"
+
+    - name: Require MongoDB credentials from the web host
+      ansible.builtin.assert:
+        that:
+          - mongo_api_preflight.rc == 0
+        fail_msg: MongoDB app credentials failed verification from the web host.
+      when: "'web' in group_names"
+
+    - name: Install the API systemd unit
+      ansible.builtin.template:
+        src: templates/travelmemory-api.service.j2
+        dest: /etc/systemd/system/travelmemory-api.service
+        owner: root
+        group: root
+        mode: "0644"
+      notify:
+        - Reload systemd
+        - Restart TravelMemory API
+      when: "'web' in group_names"
+
+    - name: Enable and start the API service
+      ansible.builtin.systemd:
+        name: travelmemory-api
+        enabled: true
+        state: started
+        daemon_reload: true
+      when: "'web' in group_names"
+
+    - name: Create the Nginx document root
+      ansible.builtin.file:
+        path: "{{ web_root }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      when: "'web' in group_names"
+
+    - name: Publish the React build
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../frontend/build/"
+        dest: "{{ web_root }}/"
+        owner: root
+        group: root
+        mode: "0644"
+        directory_mode: "0755"
+      when: "'web' in group_names"
+
+    - name: Remove the default Nginx site
+      ansible.builtin.file:
+        path: /etc/nginx/conf.d/default.conf
+        state: absent
+      notify: Restart Nginx
+      when: "'web' in group_names"
+
+    - name: Configure Nginx for the React app and Express API
+      ansible.builtin.template:
+        src: templates/travelmemory-nginx.conf.j2
+        dest: /etc/nginx/conf.d/travelmemory.conf
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart Nginx
+      when: "'web' in group_names"
+
+    - name: Enable and start Nginx
+      ansible.builtin.systemd:
+        name: nginx
+        enabled: true
+        state: started
+      when: "'web' in group_names"
+
+    - name: Verify the API health endpoint through Nginx
+      ansible.builtin.uri:
+        url: http://127.0.0.1/hello
+        status_code: 200
+      when: "'web' in group_names"
+
+  handlers:
+    - name: Restart SSH daemon
+      ansible.builtin.service:
+        name: sshd
+        state: restarted
+
+    - name: Restart MongoDB
+      ansible.builtin.service:
+        name: mongod
+        state: restarted
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Restart TravelMemory API
+      ansible.builtin.systemd:
+        name: travelmemory-api
+        state: restarted
+        daemon_reload: true
+
+    - name: Restart Nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: restarted
